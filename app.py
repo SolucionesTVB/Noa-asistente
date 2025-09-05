@@ -1,21 +1,21 @@
-# app.py — Noa Asistente (Wasender + Render)
+# app.py — Noa Asistente (Wasender + Render) con diagnósticos
 from flask import Flask, request, jsonify
-import os, requests
+import os, requests, re
 from datetime import datetime
 
 app = Flask(__name__)
 
-# ====== ENV ======
+# ===== ENV =====
 WASENDER_BASE_URL = os.getenv("WASENDER_BASE_URL", "https://wasenderapi.com/api/send-message").strip()
 WASENDER_TOKEN    = (os.getenv("WASENDER_TOKEN") or "").strip()
 OWNER_PHONE       = os.getenv("OWNER_PHONE", "+50660457989").strip()
 BOT_NAME          = os.getenv("BOT_NAME", "Noa Asistente").strip()
 
-# Normaliza por si te pasaron el dominio sin el path
+# Normaliza por si te pasaron solo el dominio
 if WASENDER_BASE_URL.rstrip("/") == "https://wasenderapi.com":
     WASENDER_BASE_URL = "https://wasenderapi.com/api/send-message"
 
-# ====== util ======
+# ===== Utils =====
 def append_log(line: str):
     try:
         with open("logs.txt", "a") as f:
@@ -23,8 +23,20 @@ def append_log(line: str):
     except Exception as e:
         print("[LOG WARN]", e)
 
+def clean_msisdn(n: str) -> str:
+    """+506XXXXXXXX sin espacios/guiones."""
+    if not n: return n
+    n = re.sub(r"[^\d+]", "", n)
+    if n.startswith("506") and not n.startswith("+"):
+        n = "+" + n
+    return n
+
 def send_message(to: str, text: str):
-    """Envía mensaje por Wasender y loguea el resultado."""
+    """Envía mensaje por Wasender y loguea resultado."""
+    to = clean_msisdn(to or "")
+    if not to:
+        print("[SEND] número vacío")
+        return
     if not WASENDER_TOKEN:
         print("[SEND] Falta WASENDER_TOKEN")
         return
@@ -41,7 +53,7 @@ def send_message(to: str, text: str):
         print("[Wasender ERROR]", e)
         append_log(f"SEND ERROR -> {to} | {e}")
 
-# ====== parse webhook (lista o dict) ======
+# ===== Parse webhook (lista o dict) =====
 def get_message_node(payload: dict) -> dict:
     data = payload.get("data", {})
     msg = data.get("messages")
@@ -61,10 +73,13 @@ def extract_sender_and_text(payload: dict):
     sender = remote_jid.split("@")[0] if remote_jid else None
     # texto
     message_obj = (msg.get("message") or {})
-    text = (message_obj.get("conversation") or "").strip()
-    return sender, text
+    # soporta conversation y extendedTextMessage.body
+    text = (message_obj.get("conversation")
+            or (message_obj.get("extendedTextMessage") or {}).get("text")
+            or "").strip()
+    return clean_msisdn(sender), text
 
-# ====== intents ======
+# ===== Intents =====
 def handle_intent(text: str, sender: str) -> str:
     t = (text or "").lower().strip()
 
@@ -83,7 +98,7 @@ def handle_intent(text: str, sender: str) -> str:
             return "Decime el texto de la nota: `nota: …`"
 
     # saludos
-    if t in ("hola", "hello", "buenas") or "hola " in t or "buenas " in t:
+    if any(k in t for k in ("hola", "buenas", "hello")):
         return f"👋 Hola, soy *{BOT_NAME}*. ¿En qué te ayudo hoy?"
 
     # seguros
@@ -101,19 +116,19 @@ def handle_intent(text: str, sender: str) -> str:
         return "📑 Para cotizar: *nombre, correo y tipo de seguro* (Todo Riesgo, Construcción, Electrónicos)."
 
     # agenda
-    if "agendar" in t or "llamar" in t or "llamada" in t:
+    if any(k in t for k in ("agendar", "llamar", "llamada")):
         return "📞 ¿Te agendo una llamada? Decime día y hora."
 
-    # recordatorios (placeholder de almacenamiento)
-    if "recordame" in t or "recordar" in t or "recordatorio" in t:
+    # recordatorios
+    if any(k in t for k in ("recordame", "recordar", "recordatorio")):
         append_log(f"[REMINDER] {sender}: {text}")
-        return "⏰ Anotado. (Pronto se conecta a calendario para recordarte automático)."
+        return "⏰ Anotado. (Pronto se conecta a calendario)."
 
     # fallback
     return ("🤖 Puedo ayudarte con *seguros en Costa Rica* (Todo Riesgo, Construcción, Electrónicos), "
             "cotizaciones y recordatorios. ¿Qué ocupás?")
 
-# ====== routes ======
+# ===== Rutas =====
 @app.route("/", methods=["GET"])
 def home():
     return f"{BOT_NAME} está activo ✅"
@@ -123,23 +138,36 @@ def webhook():
     payload = request.get_json(silent=True) or {}
     print("==> Webhook payload:", payload)
     append_log(f"PAYLOAD {str(payload)[:500]}")
-
     try:
         sender, text = extract_sender_and_text(payload)
         print(f"[WH] sender={sender} | text={text}")
-
         if not sender:
             return jsonify({"ok": True, "note": "no sender"}), 200
-
         reply = handle_intent(text, sender)
         if reply:
             send_message(sender, reply)
-
     except Exception as e:
         print("[Webhook ERROR]", e)
         append_log(f"WEBHOOK ERROR {e}")
-
     return jsonify({"ok": True}), 200
+
+# ===== Endpoints de diagnóstico =====
+@app.route("/debug", methods=["GET"])
+def debug():
+    masked_token = (WASENDER_TOKEN[:6] + "…" + WASENDER_TOKEN[-6:]) if WASENDER_TOKEN else ""
+    return jsonify({
+        "BOT_NAME": BOT_NAME,
+        "OWNER_PHONE": OWNER_PHONE,
+        "WASENDER_BASE_URL": WASENDER_BASE_URL,
+        "WASENDER_TOKEN_masked": masked_token
+    })
+
+@app.route("/self-test", methods=["POST"])
+def self_test():
+    """Envía un ping a OWNER_PHONE para validar token/env sin Wasender Webhook."""
+    msg = "Ping de Noa ✅ (self-test)"
+    send_message(OWNER_PHONE, msg)
+    return jsonify({"ok": True, "sent_to": OWNER_PHONE, "text": msg})
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "5000"))
