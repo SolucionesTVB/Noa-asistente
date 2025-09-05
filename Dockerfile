@@ -1,17 +1,18 @@
-# Imagen base
+# Imagen base de Python ligera
 FROM python:3.11-slim
 
-# Crear directorio
+# Establecer directorio de trabajo
 WORKDIR /app
 
-# Copiar archivos
+# Instalar dependencias
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Copiar código fuente
 COPY . .
 
-# Puerto para Render
+# Exponer puerto (Render lo sobreescribe con $PORT)
 EXPOSE 5000
 
-# Comando para iniciar
+# Comando de arranque
 CMD ["gunicorn", "-b", "0.0.0.0:5000", "app:app"]
