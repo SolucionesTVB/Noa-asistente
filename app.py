@@ -1,17 +1,19 @@
 import os, re, time, json, threading, requests
 from flask import Flask, request, jsonify
 
-# ---------------- Base Flask ----------------
 app = Flask(__name__)
-WS_TOKEN    = "551e81dc3c384cb437675f4066e84e081595a38d35193921f4e7eb3556e97466"  # sin "Bearer"
-WS_SEND_URL = "https://wasenderapi.com/api/send-message"                          # {"to":"...","text":"..."}
-BOT_NAME    = "Noa"
-ADMIN_TOKEN = "noa-admin-123"  # simple (luego lo movemos a env var)
 
-SESS      = {}       # phone -> {"intent":..., "step":..., "data":{...}}
-SEEN_IDS  = set()    # anti-duplicado
-LAST_SENT = {}       # rate limit por destinatario
-MIN_GAP   = 5
+# ======= Credenciales y config =======
+WS_TOKEN    = "551e81dc3c384cb437675f4066e84e081595a38d35193921f4e7eb3556e97466"  # sin "Bearer"
+WS_SEND_URL = "https://wasenderapi.com/api/send-message"
+BOT_NAME    = "Noa"
+ADMIN_TOKEN = "noa-admin-123"
+
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+DB_ENABLED = bool(DATABASE_URL)
+
+SESS, SEEN_IDS, LAST_SENT = {}, set(), {}
+MIN_GAP = 5  # Wasender: 1 msg cada 5s
 
 def _norm_text(t): 
     if not t: return ""
@@ -40,9 +42,8 @@ def send_text(to, text):
     if ok: LAST_SENT[to] = time.time()
     return ok
 
-# ---------------- Parseo Webhook (incluye Wasender messages.upsert) ----------------
+# ======= Webhook parser (incluye Wasender messages.upsert) =======
 def parse_event(payload: dict):
-    # Plano
     for k in ("from","jid","sender","phone","number","waId"):
         v = payload.get(k)
         if isinstance(v,str) and v.strip():
@@ -50,23 +51,18 @@ def parse_event(payload: dict):
             text = payload.get("text") or payload.get("message") or payload.get("body") or ""
             if isinstance(text, dict): text = text.get("body") or text.get("text") or ""
             return sender, _norm_text(text)
-
-    # Wasender: messages.upsert
     if payload.get("event") == "messages.upsert":
         data = payload.get("data") or {}
         m = data.get("messages") or {}
         if isinstance(m, list): m = m[0] if m else {}
         if not isinstance(m, dict): return None, None
-
         mid = (m.get("key") or {}).get("id") or m.get("id")
         if mid:
             if mid in SEEN_IDS: return None, None
             if len(SEEN_IDS) > 2000: SEEN_IDS.clear()
             SEEN_IDS.add(mid)
-
         if (m.get("key") or {}).get("fromMe") or m.get("fromMe"): 
             return None, None
-
         sender = _norm_to(m.get("remoteJid") or (m.get("key") or {}).get("remoteJid") or "")
         msg = m.get("message") or {}
         text = ""
@@ -77,101 +73,136 @@ def parse_event(payload: dict):
                 or (msg.get("videoMessage") or {}).get("caption") \
                 or ""
         return sender, _norm_text(text)
-
     return None, None
 
-# ---------------- NLU (TF-IDF + SGDClassifier) ----------------
-# Semillas de intents (ajustables)
+# ======= NLU (sklearn) =======
 CLASSES = ["auto_ins","schedule","statement","reminder","greet","fallback"]
 SEED = [
-    # auto_ins
     ("quiero asegurar mi carro", "auto_ins"),
     ("necesito seguro de auto", "auto_ins"),
     ("cotización para vehículo", "auto_ins"),
     ("seguro todo riesgo del carro", "auto_ins"),
     ("asegurar mi vehículo", "auto_ins"),
-    # schedule
     ("agendá con jeff el 15 de setiembre a las 9am", "schedule"),
     ("quiero una reunión mañana a las 10", "schedule"),
     ("programar cita para el 20/09 3 pm", "schedule"),
     ("agendar reunión", "schedule"),
-    # statement
     ("estado de cuenta", "statement"),
     ("quiero ver mi saldo", "statement"),
     ("cuánto debo", "statement"),
-    # reminder
     ("enviar recordatorio de pago", "reminder"),
     ("mandar cobro a juan por 35000", "reminder"),
     ("recordatorio a cliente por mensualidad", "reminder"),
-    # greet
     ("hola", "greet"), ("buenas", "greet"), ("buenos días", "greet"), ("hey", "greet"),
-    # fallback
     ("no entiendo", "fallback"), ("ayuda", "fallback"), ("???", "fallback"),
 ]
 
-# Modelo global
 VECTORIZER = None
 CLF        = None
 LABEL2ID   = {c:i for i,c in enumerate(CLASSES)}
 ID2LABEL   = {i:c for c,i in LABEL2ID.items()}
-USER_DATA_PATH = "nlu_user.json"
 LOCK = threading.Lock()
 
-def _load_user_samples():
+# ======= Persistencia: Postgres (preferido) o archivo (fallback) =======
+USER_DATA_PATH = "nlu_user.json"
+
+def db_exec(sql, params=None, fetch=False):
+    import psycopg2
+    conn = psycopg2.connect(DATABASE_URL, sslmode="require" if "render.com" in DATABASE_URL or "neon.tech" in DATABASE_URL else None)
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, params or ())
+                if fetch:
+                    return cur.fetchall()
+    finally:
+        conn.close()
+
+def ensure_schema():
+    if not DB_ENABLED: return
+    try:
+        db_exec("""
+        CREATE TABLE IF NOT EXISTS nlu_samples (
+            id BIGSERIAL PRIMARY KEY,
+            text TEXT NOT NULL,
+            intent VARCHAR(64) NOT NULL,
+            created_at TIMESTAMPTZ DEFAULT NOW()
+        );
+        """)
+        print("[DB] nlu_samples OK")
+    except Exception as e:
+        print("[DB] init error:", e)
+
+def load_user_samples():
+    # Prefiere DB
+    if DB_ENABLED:
+        try:
+            rows = db_exec("SELECT text, intent FROM nlu_samples ORDER BY id ASC;", fetch=True) or []
+            return [(r[0], r[1]) for r in rows]
+        except Exception as e:
+            print("[DB] read error:", e)
+    # Fallback archivo
     try:
         with open(USER_DATA_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
-        out = [(d["text"], d["intent"]) for d in data if d.get("text") and d.get("intent") in CLASSES]
-        return out
+        return [(d["text"], d["intent"]) for d in data if d.get("text") and d.get("intent") in CLASSES]
     except Exception:
         return []
 
-def _save_user_sample(text, intent):
+def save_user_sample(text, intent):
+    if DB_ENABLED:
+        try:
+            db_exec("INSERT INTO nlu_samples (text, intent) VALUES (%s, %s);", (text, intent))
+            return
+        except Exception as e:
+            print("[DB] insert error:", e)
+    # Fallback archivo
     try:
-        arr = _load_user_samples()
+        arr = []
+        if os.path.exists(USER_DATA_PATH):
+            with open(USER_DATA_PATH, "r", encoding="utf-8") as f:
+                arr = json.load(f)
         arr.append({"text": text, "intent": intent})
         with open(USER_DATA_PATH, "w", encoding="utf-8") as f:
             json.dump(arr, f, ensure_ascii=False)
     except Exception as e:
-        print("[NLU] save_user_sample error:", e)
+        print("[NLU] file save error:", e)
 
 def nlu_retrain():
     global VECTORIZER, CLF
     from sklearn.feature_extraction.text import TfidfVectorizer
     from sklearn.linear_model import SGDClassifier
-    X_text = [t for t,_ in SEED] + [t for t,_ in _load_user_samples()]
-    y_lab  = [y for _,y in SEED] + [y for _,y in _load_user_samples()]
-    if not X_text:
-        X_text = ["hola"]; y_lab = ["greet"]
+    user = load_user_samples()
+    X_text = [t for t,_ in SEED] + [t for t,_ in user]
+    y_lab  = [y for _,y in SEED] + [y for _,y in user]
+    if not X_text: 
+        X_text, y_lab = ["hola"], ["greet"]
     VECTORIZER = TfidfVectorizer(ngram_range=(1,2), max_features=20000, sublinear_tf=True)
     X = VECTORIZER.fit_transform([_lc(t) for t in X_text])
     y = [LABEL2ID.get(lbl, LABEL2ID["fallback"]) for lbl in y_lab]
-    CLF = SGDClassifier(loss="log_loss", alpha=1e-5, max_iter=2000, tol=1e-3)
+    from sklearn.linear_model import SGDClassifier as _SGD
+    CLF = _SGD(loss="log_loss", alpha=1e-5, max_iter=2000, tol=1e-3)
     CLF.fit(X, y)
-    print("[NLU] modelo entrenado con", len(y), "ejemplos.")
+    print(f"[NLU] modelo entrenado con {len(y)} ejemplos (DB={'on' if DB_ENABLED else 'off'})")
 
 def nlu_predict(text):
     t = _lc(text)
-    if not t.strip(): 
-        return "fallback", 0.0
+    if not t.strip(): return "fallback", 0.0
     X = VECTORIZER.transform([t])
     try:
         proba = CLF.predict_proba(X)[0]
-        idx = int(proba.argmax())
-        conf = float(proba[idx])
+        idx = int(proba.argmax()); conf = float(proba[idx])
         return ID2LABEL[idx], conf
     except Exception:
         idx = int(CLF.predict(X)[0]); 
         return ID2LABEL[idx], 0.5
 
-# Entrenar al arrancar
+# Inicializar DB y modelo
+ensure_schema()
 nlu_retrain()
 
-# ---------------- Reglas y flujos (sin menús) ----------------
-MESES = {
-    "enero":1,"febrero":2,"marzo":3,"abril":4,"mayo":5,"junio":6,
-    "julio":7,"agosto":8,"septiembre":9,"setiembre":9,"octubre":10,"noviembre":11,"diciembre":12
-}
+# ======= Reglas conversacionales (sin menús) =======
+MESES = {"enero":1,"febrero":2,"marzo":3,"abril":4,"mayo":5,"junio":6,"julio":7,"agosto":8,"septiembre":9,"setiembre":9,"octubre":10,"noviembre":11,"diciembre":12}
 def parse_datetime_sp(text):
     t = _lc(text)
     m = re.search(r'(\d{1,2})\s*(?:de\s+)?(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|setiembre|octubre|noviembre|diciembre)\b.*?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?', t)
@@ -182,8 +213,9 @@ def parse_datetime_sp(text):
     if m: return None, None, int(m.group(1)), int(m.group(2) or 0), m.group(3).lower()
     return None
 
-def greet(to):
-    send_text(to, f"¡Hola! Soy {BOT_NAME}. Contame en una frase qué necesitás: asegurar tu carro, agendar una reunión, estado de cuenta o un recordatorio de pago.")
+def greet(to):            send_text(to, f"¡Hola! Soy {BOT_NAME}. Contame en una frase qué necesitás: asegurar tu carro, agendar una reunión, estado de cuenta o un recordatorio de pago.")
+def handle_statement(to): send_text(to, "Con gusto. Pasame tu *cédula o correo* y te devuelvo el estado de cuenta.")
+def handle_reminder(to):  send_text(to, "Decime *nombre del cliente* y *monto* para enviar el recordatorio de pago (ej.: Juan Pérez, ₡35.000 por mensualidad).")
 
 def handle_auto(to, text):
     st = SESS.setdefault(to, {"intent":"auto_ins","step":1,"data":{}})
@@ -220,16 +252,17 @@ def handle_schedule(to, text):
     else:
         send_text(to, "¿Para qué *día y hora* te viene bien? Ej.: *15/09 9am* o *15 de setiembre 9:30 am*. Si es con alguien, decime *con quién*.")
 
-def handle_statement(to): send_text(to, "Con gusto. Pasame tu *cédula o correo* y te devuelvo el estado de cuenta.")
-def handle_reminder(to):  send_text(to, "Decime *nombre del cliente* y *monto* para enviar el recordatorio de pago (ej.: Juan Pérez, ₡35.000 por mensualidad).")
 def handle_fallback(to, text):
     send_text(to, "No te entendí del todo. Decime en una frase qué necesitás (p.ej. *asegurar mi carro*, *agendar con Jeff 15/09 9am*, *estado de cuenta*, *recordatorio de pago*).")
 
-# ---------------- Rutas HTTP ----------------
+# ======= Rutas HTTP =======
 @app.get("/")
-def root():   return jsonify(ok=True, service="noa-backend", endpoints=["/health","/webhook","/nlu/debug","/feedback","/nlu/retrain"])
+def root():
+    return jsonify(ok=True, service="noa-backend", endpoints=["/health","/webhook","/nlu/debug","/feedback","/nlu/retrain"], db= "on" if DB_ENABLED else "off")
+
 @app.get("/health")
-def health(): return jsonify(ok=True, status="healthy")
+def health():
+    return jsonify(ok=True, status="healthy", db=("on" if DB_ENABLED else "off"))
 
 @app.post("/webhook")
 def webhook():
@@ -239,26 +272,18 @@ def webhook():
     print(f"[WH] sender={sender or ''} | text={text or ''}")
     if not sender: return jsonify(ok=True, note="ignored"), 200
 
-    # Si hay flujo abierto (auto)
     st = SESS.get(sender)
     if st and st.get("intent") == "auto_ins":
         handle_auto(sender, text);  return jsonify(ok=True)
 
-    # --- NLU ML + fallback conservador ---
     intent, conf = nlu_predict(text)
     print(f"[NLU] intent={intent} conf={conf:.2f}")
-
     if conf < 0.55:
-        # pequeño refuerzo con heurística segura
         t = _lc(text)
-        if any(w in t for w in ("asegur","seguro","cotiz")) and any(w in t for w in ("carro","auto","vehicul")):
-            intent = "auto_ins"; conf = 0.7
-        elif any(w in t for w in ("agend","reunion","reunión","cita","agenda")):
-            intent = "schedule"; conf = 0.7
-        elif "estado de cuenta" in t or "saldo" in t or "cuenta" in t:
-            intent = "statement"; conf = 0.7
-        elif "pago" in t or "recordatorio" in t or "cobrar" in t:
-            intent = "reminder"; conf = 0.7
+        if any(w in t for w in ("asegur","seguro","cotiz")) and any(w in t for w in ("carro","auto","vehicul")): intent, conf = "auto_ins", 0.7
+        elif any(w in t for w in ("agend","reunion","reunión","cita","agenda")): intent, conf = "schedule", 0.7
+        elif "estado de cuenta" in t or "saldo" in t or "cuenta" in t: intent, conf = "statement", 0.7
+        elif "pago" in t or "recordatorio" in t or "cobrar" in t: intent, conf = "reminder", 0.7
 
     if intent == "greet":      greet(sender)
     elif intent == "auto_ins": handle_auto(sender, text)
@@ -268,34 +293,31 @@ def webhook():
     else:                      handle_fallback(sender, text)
     return jsonify(ok=True)
 
-# ---- Herramientas de entrenamiento ----
 @app.get("/nlu/debug")
 def nlu_debug():
     text = request.args.get("text","")
     label, conf = nlu_predict(text)
-    return jsonify(text=text, intent=label, confidence=conf)
+    return jsonify(text=text, intent=label, confidence=conf, db=("on" if DB_ENABLED else "off"))
 
 @app.post("/feedback")
 def feedback():
     token = request.headers.get("X-Admin-Token") or request.args.get("token") or (request.get_json(silent=True) or {}).get("token")
     if token != ADMIN_TOKEN: return jsonify(ok=False, error="unauthorized"), 401
     body = request.get_json(force=True) or {}
-    text = body.get("text","").strip()
-    intent = body.get("intent","").strip()
+    text = (body.get("text") or "").strip()
+    intent = (body.get("intent") or "").strip()
     if not text or intent not in CLASSES: return jsonify(ok=False, error="bad_input"), 400
     with LOCK:
-        _save_user_sample(text, intent)
-        # reentreno ligero: solo partial -> para simplicidad, entrenamos full en background
+        save_user_sample(text, intent)
         threading.Thread(target=nlu_retrain, daemon=True).start()
-    return jsonify(ok=True)
+    return jsonify(ok=True, db=("on" if DB_ENABLED else "off"))
 
 @app.post("/nlu/retrain")
 def nlu_retrain_endpoint():
     token = request.headers.get("X-Admin-Token") or request.args.get("token") or (request.get_json(silent=True) or {}).get("token")
     if token != ADMIN_TOKEN: return jsonify(ok=False, error="unauthorized"), 401
-    with LOCK:
-        nlu_retrain()
-    return jsonify(ok=True, msg="retrained")
-    
+    with LOCK: nlu_retrain()
+    return jsonify(ok=True, msg="retrained", db=("on" if DB_ENABLED else "off"))
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
