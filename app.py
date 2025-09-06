@@ -1,11 +1,11 @@
-import os, json, time, requests
+import os, time, requests
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
 # Credenciales embebidas (como pediste)
 WS_TOKEN   = "551e81dc3c384cb437675f4066e84e081595a38d35193921f4e7eb3556e97466"  # sin "Bearer"
-WS_SEND_URL= "https://wasenderapi.com/api/send-message"  # espera {"to": "...", "text": "..."}
+WS_SEND_URL= "https://wasenderapi.com/api/send-message"  # espera {"to":"...","text":"..."}
 
 MENU = (
     "🤖 *Noa* — Asistente de Cobros\n"
@@ -15,122 +15,85 @@ MENU = (
     "Escribe *1*, *2* o *3*. Escribe *menu* para volver aquí."
 )
 
-def normalize_text(t: str) -> str:
+def _norm_text(t: str) -> str:
     return (t or "").strip().lower()
 
-def normalize_to(n: str) -> str:
+def _norm_to(n: str) -> str:
     s = str(n or "")
-    s = s.split("@")[0]           # quita '@s.whatsapp.net'
+    s = s.split("@")[0]                 # quita '@s.whatsapp.net'
     s = s.replace(" ", "").replace("-", "")
-    if s.startswith("+"):
-        return s
-    # si viene sin +, igual lo dejamos (Wasender acepta sin + en muchos casos)
-    return s
+    return s if s else ""
 
-# Memorias simples para anti-spam / dedupe
-SEEN_IDS = set()
-LAST_SENT_AT = {}   # to -> timestamp
-MIN_GAP_SEC = 5     # Wasender pide 1 msg cada 5s
+LAST_SENT = {}
+MIN_GAP = 5  # Wasender: 1 mensaje cada 5s
 
 def send_text(to: str, text: str) -> bool:
-    if not WS_TOKEN or not WS_SEND_URL or not to:
-        print("[ERR] send_text: faltan datos (token/url/to).")
-        return False
+    if not (to and WS_TOKEN and WS_SEND_URL):
+        print("[ERR] send_text: faltan datos."); return False
 
-    # Respetar rate limit simple por destinatario
+    # rate limit simple por destinatario
     now = time.time()
-    tprev = LAST_SENT_AT.get(to, 0)
-    gap = now - tprev
-    if gap < MIN_GAP_SEC:
-        wait = MIN_GAP_SEC - gap
-        print(f"[RATE] Esperando {wait:.1f}s para {to}")
+    prev = LAST_SENT.get(to, 0)
+    if now - prev < MIN_GAP:
+        wait = MIN_GAP - (now - prev)
+        print(f"[RATE] Esperando {wait:.1f}s -> {to}")
         time.sleep(wait)
 
     headers = {"Authorization": f"Bearer {WS_TOKEN}", "Content-Type": "application/json"}
     payload = {"to": to, "text": text}
+    r = requests.post(WS_SEND_URL, json=payload, headers=headers, timeout=15)
+    print(f"[Wasender] {r.status_code} {r.text[:200]}")
 
-    try:
+    if r.status_code == 429:
+        # reintento único respetando retry_after si viene
+        try:
+            ra = max(2, min(10, int(r.json().get("retry_after", 5))))
+        except Exception:
+            ra = 5
+        print(f"[Wasender] 429 -> reintento en {ra}s")
+        time.sleep(ra)
         r = requests.post(WS_SEND_URL, json=payload, headers=headers, timeout=15)
-        print(f"[Wasender] {r.status_code} {r.text[:200]}")
-        if r.status_code == 429:
-            # Intentar una sola vez respetando retry_after si viene
-            try:
-                ra = r.json().get("retry_after", 5)
-            except Exception:
-                ra = 5
-            ra = max(2, min(10, int(ra)))
-            print(f"[Wasender] 429: reintentando en {ra}s…")
-            time.sleep(ra)
-            r = requests.post(WS_SEND_URL, json=payload, headers=headers, timeout=15)
-            print(f"[Wasender][retry] {r.status_code} {r.text[:200]}")
-        ok = 200 <= r.status_code < 300
-        if ok:
-            LAST_SENT_AT[to] = time.time()
-        return ok
-    except Exception as e:
-        print(f"[ERR] send_text: {e}")
-        return False
+        print(f"[Wasender][retry] {r.status_code} {r.text[:200]}")
 
-def extract_sender_and_text(payload: dict):
+    ok = 200 <= r.status_code < 300
+    if ok: LAST_SENT[to] = time.time()
+    return ok
+
+def parse_event(payload: dict):
     """
-    Devuelve (sender, text) o (None, None) si hay que ignorar (p.ej. fromMe=True).
-    Soporta:
+    Retorna (sender, text) soportando:
     - Plano: {"from": "...", "text": "..."} y variantes
-    - Wasender 'messages.upsert' con:
-        data.messages.key.remoteJid -> '506XXXX@s.whatsapp.net'
-        data.messages.message.conversation
-        data.messages.message.extendedTextMessage.text
-    - Ignora eventos where fromMe=True (nuestro propio mensaje)
+    - Wasender: {"event":"messages.upsert", "data":{"messages":{ ... }}}
+      * Ignora fromMe=True (eco propio)
+      * Toma remoteJid y conversation / extendedTextMessage.text
     """
-    # 0) plano
+    # 1) Plano
     for k in ("from", "jid", "sender", "phone", "number", "waId"):
         v = payload.get(k)
         if isinstance(v, str) and v.strip():
-            sender = normalize_to(v)
-            text = None
-            # texto directo o anidado
-            for tk in ("text", "message", "body", "msg"):
-                tv = payload.get(tk)
-                if isinstance(tv, str) and tv.strip():
-                    text = normalize_text(tv); break
-                if isinstance(tv, dict):
-                    for kk in ("body", "text"):
-                        vv = tv.get(kk)
-                        if isinstance(vv, str) and vv.strip():
-                            text = normalize_text(vv); break
-                if text: break
-            return sender, text or ""
+            sender = _norm_to(v)
+            text = payload.get("text") or payload.get("message") or payload.get("body") or ""
+            if isinstance(text, dict):
+                text = text.get("body") or text.get("text") or ""
+            return sender, _norm_text(text)
 
-    # 1) evento upsert (estructura que estás viendo en logs)
+    # 2) messages.upsert (lo que muestran tus logs)
     if payload.get("event") == "messages.upsert":
-        data = payload.get("data", {}) or {}
-        m = data.get("messages", {}) or {}
-        # puede venir lista, tomamos el primero
+        data = payload.get("data") or {}
+        m = data.get("messages") or {}
         if isinstance(m, list):
             m = m[0] if m else {}
         if not isinstance(m, dict):
             return None, None
 
-        # dedupe por id
-        mid = (m.get("key", {}) or {}).get("id") or m.get("id")
-        if mid:
-            if mid in SEEN_IDS:
-                print(f"[DEDUPE] Ignorando id repetido {mid}")
-                return None, None
-            # limitar memoria
-            if len(SEEN_IDS) > 2000:
-                SEEN_IDS.clear()
-            SEEN_IDS.add(mid)
-
-        # ignorar mensajes nuestros
-        if (m.get("key", {}) or {}).get("fromMe") or m.get("fromMe"):
+        # ignorar mensajes nuestros (fromMe True)
+        from_me = (m.get("key") or {}).get("fromMe") or m.get("fromMe")
+        if from_me:
             return None, None
 
-        # extraer remitente
-        sender = m.get("remoteJid") or (m.get("key", {}) or {}).get("remoteJid") or ""
-        sender = normalize_to(sender)
+        sender = m.get("remoteJid") or (m.get("key") or {}).get("remoteJid") or ""
+        sender = _norm_to(sender)
 
-        # extraer texto
         msg = m.get("message") or {}
         text = ""
         if isinstance(msg, dict):
@@ -140,7 +103,7 @@ def extract_sender_and_text(payload: dict):
                 or (msg.get("videoMessage") or {}).get("caption") \
                 or ""
 
-        return sender, normalize_text(text)
+        return sender, _norm_text(text)
 
     return None, None
 
@@ -154,13 +117,13 @@ def health():
 
 @app.post("/webhook")
 def webhook():
-    data = request.get_json(force=True, silent=True) or {}
-    print("==> Webhook payload:", data)
+    payload = request.get_json(force=True, silent=True) or {}
+    print("==> Webhook payload:", payload)
 
-    sender, text_in = extract_sender_and_text(data)
+    sender, text_in = parse_event(payload)
     print(f"[WH] sender={sender or ''} | text={text_in or ''}")
 
-    # Si no hay remitente (p.ej. era fromMe o un evento sin mensaje), salimos OK sin responder
+    # Si no hay remitente (p.ej. eco nuestro), no respondemos
     if not sender:
         return jsonify(ok=True, note="ignored"), 200
 
