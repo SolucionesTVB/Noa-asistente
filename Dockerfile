@@ -1,18 +1,14 @@
-# Imagen base de Python ligera
 FROM python:3.11-slim
 
-# Establecer directorio de trabajo
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
 WORKDIR /app
 
-# Instalar dependencias
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copiar código fuente
 COPY . .
 
-# Exponer puerto (Render lo sobreescribe con $PORT)
-EXPOSE 5000
-
-# Comando de arranque
-CMD ["gunicorn", "-b", "0.0.0.0:5000", "app:app"]
+# Render inyecta $PORT. Usamos gunicorn con gthread (estable para I/O).
+CMD ["bash","-lc","gunicorn -w 2 -k gthread --threads 8 -b 0.0.0.0:$PORT app:app"]
