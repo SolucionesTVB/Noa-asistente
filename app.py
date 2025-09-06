@@ -3,11 +3,9 @@ from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# ====== Variables de entorno (Render → Settings → Environment) ======
-# WS_TOKEN: SOLO el token (sin la palabra "Bearer")
-# WS_SEND_URL: https://api.wasenderapi.com/message/sendText
-WS_TOKEN = os.getenv("WS_TOKEN", "")
-WS_SEND_URL = os.getenv("WS_SEND_URL", "")
+# Credenciales embebidas (como pediste)
+WS_TOKEN   = "551e81dc3c384cb437675f4066e84e081595a38d35193921f4e7eb3556e97466"  # sin "Bearer"
+WS_SEND_URL= "https://wasenderapi.com/api/send-message"
 
 MENU = (
     "🤖 *Noa* — Asistente de Cobros\n"
@@ -17,54 +15,34 @@ MENU = (
     "Escribe *1*, *2* o *3*. Escribe *menu* para volver aquí."
 )
 
-def send_text(jid: str, text: str) -> bool:
+def send_text(to: str, text: str) -> bool:
     if not WS_TOKEN or not WS_SEND_URL:
-        print("[ERR] Faltan WS_TOKEN o WS_SEND_URL en variables de entorno.")
-        return False
-    headers = {
-        "Authorization": f"Bearer {WS_TOKEN}",
-        "Content-Type": "application/json"
-    }
-    payload = {"jid": jid, "message": text}
+        print("[ERR] Faltan credenciales Wasender."); return False
+    headers = {"Authorization": f"Bearer {WS_TOKEN}", "Content-Type": "application/json"}
     try:
-        r = requests.post(WS_SEND_URL, json=payload, headers=headers, timeout=10)
-        print(f"[Wasender] {r.status_code} {r.text[:200]}")
-        return r.ok
+        r = requests.post(WS_SEND_URL, json={"to": to, "text": text}, headers=headers, timeout=15)
+        print(f"[Wasender] {r.status_code} {r.text[:200]}"); return r.ok
     except Exception as e:
-        print(f"[ERR] send_text: {e}")
-        return False
+        print(f"[ERR] send_text: {e}"); return False
 
-def normalize_text(t: str) -> str:
-    return (t or "").strip().lower()
+def norm(t: str) -> str: return (t or "").strip().lower()
 
-@app.route("/", methods=["GET"])
-def root():
-    return jsonify(ok=True, service="noa-backend", endpoints=["/health","/webhook"])
+@app.get("/")
+def root(): return jsonify(ok=True, service="noa-backend", endpoints=["/health","/webhook"])
 
-@app.route("/health", methods=["GET"])
-def health():
-    return jsonify(ok=True, service="noa-backend", status="healthy")
+@app.get("/health")
+def health(): return jsonify(ok=True, status="healthy")
 
-@app.route("/webhook", methods=["POST"])
+@app.post("/webhook")
 def webhook():
-    data = request.get_json(force=True, silent=True) or {}
-    sender = data.get("jid") or data.get("from") or data.get("sender") or ""
-    text = normalize_text(data.get("text") or data.get("message") or data.get("body"))
-    print("==> Webhook payload:", data)
-    print(f"[WH] sender={sender} | text={text}")
+    d = request.get_json(force=True, silent=True) or {}
+    to = d.get("from") or d.get("jid") or d.get("sender") or ""
+    t  = norm(d.get("text") or d.get("message") or d.get("body"))
+    print("==> Webhook payload:", d); print(f"[WH] from={to} | text={t}")
+    if t in ("hola","buenas","menu",""): send_text(to, MENU);  return jsonify(ok=True)
+    if t=="1": send_text(to,"📩 Pásame *nombre/cédula* y monto aprox. para armar el recordatorio."); return jsonify(ok=True)
+    if t=="2": send_text(to,"📊 Dame tu *cédula o correo* y te devuelvo el estado de cuenta.");    return jsonify(ok=True)
+    if t=="3": send_text(to,"👤 Te conecto con un agente. Horario: *L–V 8:00–17:00*. Escribe *menu* para volver."); return jsonify(ok=True)
+    send_text(to,"No te entendí 🤔. Escribe *menu* para ver opciones."); return jsonify(ok=True)
 
-    if text in ("hola", "buenas", "menu", ""):
-        send_text(sender, MENU);  return jsonify(ok=True)
-    if text == "1":
-        send_text(sender, "📩 Pásame *nombre/cédula* y monto aprox. para armar el recordatorio.");  return jsonify(ok=True)
-    if text == "2":
-        send_text(sender, "📊 Dame tu *cédula o correo* y te devuelvo el estado de cuenta.");       return jsonify(ok=True)
-    if text == "3":
-        send_text(sender, "👤 Te conecto con un agente. Horario: *L–V 8:00–17:00*. Escribe *menu* para volver."); return jsonify(ok=True)
-
-    send_text(sender, "No te entendí 🤔. Escribe *menu* para ver opciones.")
-    return jsonify(ok=True)
-
-if __name__ == "__main__":
-    # Render inyecta $PORT. Por defecto 8000 si corrés local.
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+if __name__=="__main__": app.run(host="0.0.0.0", port=int(os.getenv("PORT",8000)))
