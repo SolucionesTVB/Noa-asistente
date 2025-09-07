@@ -1,6 +1,9 @@
-Flask==3.0.3
-gunicorn==22.0.0
-requests==2.32.3
-scikit-learn==1.5.1
-psycopg2-binary==2.9.9
-rapidfuzz==3.9.6
+flask
+gunicorn
+requests
+rapidfuzz
+scikit-learn
+psycopg2-binary
+sentence-transformers
+pandas
+PyPDF2
