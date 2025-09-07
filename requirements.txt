@@ -3,3 +3,4 @@ gunicorn==22.0.0
 requests==2.32.3
 scikit-learn==1.5.1
 psycopg2-binary==2.9.9
+rapidfuzz==3.9.6

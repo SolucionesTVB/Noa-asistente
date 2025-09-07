@@ -1,5 +1,6 @@
 import os, re, time, json, threading, requests
 from flask import Flask, request, jsonify
+from rapidfuzz import process, fuzz
 
 app = Flask(__name__)
 
@@ -43,7 +44,7 @@ def send_text(to, text):
     if ok: LAST_SENT[to] = time.time()
     return ok
 
-# ===== DB helpers (Postgres) =====
+# ===== DB helpers =====
 def db_conn():
     import psycopg2
     ssl = "require" if ("render.com" in DATABASE_URL or "neon.tech" in DATABASE_URL) else None
@@ -64,50 +65,49 @@ def ensure_schema():
     if not DB_ENABLED: return
     try:
         db_exec("""
-        CREATE TABLE IF NOT EXISTS nlu_samples (
-            id BIGSERIAL PRIMARY KEY,
-            text TEXT NOT NULL,
-            intent VARCHAR(64) NOT NULL,
-            created_at TIMESTAMPTZ DEFAULT NOW()
+        CREATE TABLE IF NOT EXISTS nlu_samples(
+          id BIGSERIAL PRIMARY KEY, text TEXT NOT NULL, intent VARCHAR(64) NOT NULL, created_at TIMESTAMPTZ DEFAULT NOW()
         );
         """)
         db_exec("""
-        CREATE TABLE IF NOT EXISTS sessions (
-            phone TEXT PRIMARY KEY,
-            intent VARCHAR(64),
-            step INT,
-            data JSONB DEFAULT '{}'::jsonb,
-            updated_at TIMESTAMPTZ DEFAULT NOW()
+        CREATE TABLE IF NOT EXISTS sessions(
+          phone TEXT PRIMARY KEY, intent VARCHAR(64), step INT, data JSONB DEFAULT '{}'::jsonb, updated_at TIMESTAMPTZ DEFAULT NOW()
         );
         """)
-        print("[DB] nlu_samples & sessions OK")
+        db_exec("""
+        CREATE TABLE IF NOT EXISTS car_makes(
+          make_name TEXT PRIMARY KEY
+        );
+        """)
+        db_exec("""
+        CREATE TABLE IF NOT EXISTS car_models(
+          make_name TEXT NOT NULL, model_year INT NOT NULL, model_name TEXT NOT NULL,
+          PRIMARY KEY(make_name, model_year, model_name)
+        );
+        """)
+        print("[DB] schema OK (nlu_samples, sessions, car_makes, car_models)")
     except Exception as e:
         print("[DB] init error:", e)
 
+# ===== Sesiones (DB o memoria) =====
+_MEM_SESS = {}
 def sess_get(phone):
     if not DB_ENABLED: return _MEM_SESS.get(phone)
-    rows = db_exec("SELECT intent, step, data FROM sessions WHERE phone=%s;", (phone,), fetch=True)
+    rows = db_exec("SELECT intent,step,data FROM sessions WHERE phone=%s;", (phone,), fetch=True)
     if rows:
         intent, step, data = rows[0]
         return {"intent":intent, "step":step, "data":(data or {})}
     return None
-
 def sess_set(phone, sess):
-    if not DB_ENABLED:
-        _MEM_SESS[phone] = sess; return
+    if not DB_ENABLED: _MEM_SESS[phone] = sess;  return
     db_exec("""
-    INSERT INTO sessions (phone,intent,step,data,updated_at)
-    VALUES (%s,%s,%s,%s,now())
+    INSERT INTO sessions(phone,intent,step,data,updated_at)
+    VALUES(%s,%s,%s,%s,now())
     ON CONFLICT (phone) DO UPDATE SET intent=EXCLUDED.intent, step=EXCLUDED.step, data=EXCLUDED.data, updated_at=now();
-    """, (phone, sess.get("intent"), sess.get("step"), json.dumps(sess.get("data",{}))))
-
+    """,(phone, sess.get("intent"), sess.get("step"), json.dumps(sess.get("data",{}))))
 def sess_clear(phone):
-    if not DB_ENABLED:
-        _MEM_SESS.pop(phone, None); return
+    if not DB_ENABLED: _MEM_SESS.pop(phone, None);  return
     db_exec("DELETE FROM sessions WHERE phone=%s;", (phone,))
-
-# fallback de memoria si no hay DB
-_MEM_SESS = {}
 
 # ===== Webhook parser (incluye Wasender messages.upsert) =====
 def parse_event(payload: dict):
@@ -144,7 +144,9 @@ def parse_event(payload: dict):
         return sender, _norm_text(text)
     return None, None
 
-# ===== NLU (sklearn) =====
+# ===== NLU (sklearn + feedback) =====
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import SGDClassifier
 CLASSES = ["auto_ins","schedule","statement","reminder","greet","complaint","email_only","fallback"]
 SEED = [
     ("quiero asegurar mi carro","auto_ins"),
@@ -172,7 +174,6 @@ ID2LABEL = {i:c for c,i in LABEL2ID.items()}
 VECTORIZER = None
 CLF = None
 USER_DATA_PATH = "nlu_user.json"
-LOCK = threading.Lock()
 
 def load_user_samples():
     if DB_ENABLED:
@@ -202,8 +203,6 @@ def save_user_sample(text, intent):
 
 def nlu_retrain():
     global VECTORIZER, CLF
-    from sklearn.feature_extraction.text import TfidfVectorizer
-    from sklearn.linear_model import SGDClassifier
     user = load_user_samples()
     X_text = [t for t,_ in SEED] + [t for t,_ in user]
     y_lab  = [y for _,y in SEED] + [y for _,y in user]
@@ -227,8 +226,109 @@ def nlu_predict(text):
         idx = int(CLF.predict(X)[0]); 
         return ID2LABEL[idx], 0.5
 
-ensure_schema()
-nlu_retrain()
+# ===== Catálogo de vehículos: vPIC + cache =====
+# Mem-cache si no hay DB
+MAKES_CACHE = []             # ["bmw", "toyota", ...]
+MODELS_CACHE = {}            # {(make_lower, year): ["x6","hilux",...]}
+
+def db_load_makes():
+    rows = db_exec("SELECT make_name FROM car_makes;", fetch=True) or []
+    return [r[0] for r in rows]
+def db_save_makes(makes):
+    for m in makes:
+        try: db_exec("INSERT INTO car_makes(make_name) VALUES(%s) ON CONFLICT DO NOTHING;", (m,))
+        except: pass
+def db_load_models(make, year):
+    rows = db_exec("SELECT model_name FROM car_models WHERE make_name=%s AND model_year=%s;", (make,year), fetch=True) or []
+    return [r[0] for r in rows]
+def db_save_models(make, year, models):
+    for mdl in models:
+        try:
+            db_exec("INSERT INTO car_models(make_name,model_year,model_name) VALUES(%s,%s,%s) ON CONFLICT DO NOTHING;", (make,year,mdl))
+        except: pass
+
+def vpic_get_makes():
+    url = "https://vpic.nhtsa.dot.gov/api/vehicles/getallmakes?format=json"
+    r = requests.get(url, timeout=15)
+    arr = [x["Make_Name"].lower() for x in (r.json().get("Results") or []) if x.get("Make_Name")]
+    return sorted(set(arr))
+
+def vpic_get_models(make, year=None):
+    if year:
+        url = f"https://vpic.nhtsa.dot.gov/api/vehicles/GetModelsForMakeYear/make/{make}/modelyear/{year}?format=json"
+    else:
+        url = f"https://vpic.nhtsa.dot.gov/api/vehicles/GetModelsForMake/{make}?format=json"
+    r = requests.get(url, timeout=15)
+    arr = [x["Model_Name"].lower() for x in (r.json().get("Results") or []) if x.get("Model_Name")]
+    # limpiar espacios dobles
+    return sorted(set([re.sub(r'\s+',' ',a).strip() for a in arr]))
+
+def veh_fetch_makes():
+    global MAKES_CACHE
+    if MAKES_CACHE: return MAKES_CACHE
+    if DB_ENABLED:
+        try:
+            makes = db_load_makes()
+            if makes: MAKES_CACHE = makes; return MAKES_CACHE
+        except Exception as e:
+            print("[DB] load makes error:", e)
+    try:
+        makes = vpic_get_makes()
+        MAKES_CACHE = makes
+        if DB_ENABLED: db_save_makes(makes)
+    except Exception as e:
+        print("[vPIC] makes error:", e)
+    return MAKES_CACHE
+
+def veh_fetch_models(make, year=None):
+    key = (make.lower(), int(year) if year else 0)
+    if key in MODELS_CACHE: return MODELS_CACHE[key]
+    if DB_ENABLED and year:
+        try:
+            models = db_load_models(make.lower(), int(year))
+            if models: MODELS_CACHE[key] = models; return models
+        except Exception as e:
+            print("[DB] load models error:", e)
+    try:
+        models = vpic_get_models(make, year)
+        MODELS_CACHE[key] = models
+        if DB_ENABLED and year: db_save_models(make.lower(), int(year), models)
+        return models
+    except Exception as e:
+        print("[vPIC] models error:", e)
+        return []
+
+def veh_resolve(text):
+    """Devuelve dict: {'year':int|None, 'make':str|None, 'model':str|None, 'score':float, 'suggestions':[...]}"""
+    out = {"year":None,"make":None,"model":None,"score":0.0,"suggestions":[]}
+    t = _lc(text)
+    y = re.search(r'(20\d{2}|19\d{2})', t)
+    year = int(y.group(1)) if y else None
+    makes = veh_fetch_makes()
+    if not makes: return out
+    # Fuzzy para marca
+    mk, mk_score, _ = process.extractOne(t, makes, scorer=fuzz.token_set_ratio) if makes else (None,0,None)
+    if mk_score < 70:  # bajo: mejor preguntar
+        out.update(year=year, make=None, model=None, score=mk_score)
+        return out
+    out["make"] = mk
+    # Lista de modelos
+    models = veh_fetch_models(mk, year) or veh_fetch_models(mk, None)
+    if not models:
+        out.update(year=year, score=mk_score);  return out
+    # Quitar la marca del texto para buscar modelo
+    t_model = re.sub(r'\b'+re.escape(mk)+r'\b','',t).strip()
+    mdl, mdl_score, _ = process.extractOne(t_model or t, models, scorer=fuzz.WRatio)
+    out["year"] = year
+    if mdl_score >= 70:
+        out["model"] = mdl
+        out["score"] = (mk_score + mdl_score)/2/100.0
+    else:
+        # sugerir top 3
+        cand = process.extract(t_model or t, models, scorer=fuzz.WRatio, limit=3)
+        out["suggestions"] = [c[0] for c in cand]
+        out["score"] = mk_score/100.0
+    return out
 
 # ===== extractores =====
 EMAIL_RE = re.compile(r'[\w\.\+\-]+@[\w\.-]+\.\w+', re.I)
@@ -248,7 +348,7 @@ def extract_value(text):
     if m: return re.sub(r'[^0-9\.]', '', m.group(1))
     return ""
 
-# ===== intents auxiliares =====
+# ===== Intents auxiliares =====
 def heuristic_intent(text, base, conf):
     t = _lc(text)
     if conf >= 0.55: return base
@@ -260,7 +360,7 @@ def heuristic_intent(text, base, conf):
     if "no estas leyendo" in t or "no estás leyendo" in t or "no me entend" in t: return "complaint"
     return base
 
-# ===== respuestas =====
+# ===== Respuestas “humanas” =====
 def greet(to):
     send_text(to, f"¡Hola! Soy {BOT_NAME}. Contame en una frase qué necesitás: asegurar tu carro, agendar una reunión, estado de cuenta o un recordatorio de pago.")
 def complaint(to):
@@ -300,15 +400,22 @@ def handle_auto(to, text):
         s["step"] = 2; sess_set(to, s); return
 
     if s["step"] == 2:
-        year = re.search(r'(20\d{2}|19\d{2})', text or "")
-        year = year.group(1) if year else ""
-        # incluye números: 'x6'
-        words = [w for w in re.findall(r'[a-z0-9áéíóúñ]+', _lc(text))]
-        stop = {"modelo","marca","del","de","el"}
-        words = [w for w in words if w not in stop]
-        marca  = words[1] if len(words)>=2 else (words[0] if words else "")
-        modelo = words[2] if len(words)>=3 else (words[1] if len(words)>=2 else "")
-        s["data"].update({"year":year,"marca":marca,"modelo":modelo})
+        # Resolver marca/modelo/año contra catálogo real
+        res = veh_resolve(text)
+        year = res["year"]
+        make = res["make"] or ""
+        model= res["model"] or ""
+        s["data"].update({"year":year or "", "marca": make or "", "modelo": model or ""})
+
+        if not make:
+            send_text(to, "¿Qué *marca* es exactamente? (ej.: Toyota, BMW, Hyundai)")
+            sess_set(to, s); return
+
+        if make and not model and res["suggestions"]:
+            sug = ", ".join(res["suggestions"])
+            send_text(to, f"¿Qué *modelo* es? Ej.: {sug}")
+            sess_set(to, s); return
+
         send_text(to, "Perfecto. Ahora decime *valor aproximado* y tu *correo* para enviarte la cotización.")
         s["step"] = 3; sess_set(to, s); return
 
@@ -332,8 +439,8 @@ def handle_auto(to, text):
             sess_set(to, s); return
 
         y = s["data"].get("year") or "?"
-        m = s["data"].get("marca") or "?"
-        mo= s["data"].get("modelo") or "?"
+        m = (s["data"].get("marca") or "?").title()
+        mo= (s["data"].get("modelo") or "?").upper()
         v = s["data"]["valor"]; e = s["data"]["email"]
         send_text(to, f"¡Listo! Tomé: {y} {m} {mo}, valor aprox {v}. Te confirmo por correo {e} en breve. ¿Algo más?")
         sess_clear(to); return
@@ -345,12 +452,17 @@ def handle_fallback(to, text):
 @app.get("/")
 def root():
     return jsonify(ok=True, service="noa-backend",
-                   endpoints=["/health","/webhook","/nlu/debug","/feedback","/nlu/retrain"],
+                   endpoints=["/health","/webhook","/nlu/debug","/feedback","/nlu/retrain","/veh/debug"],
                    db=("on" if DB_ENABLED else "off"))
 
 @app.get("/health")
 def health():
     return jsonify(ok=True, status="healthy", db=("on" if DB_ENABLED else "off"))
+
+@app.get("/veh/debug")
+def veh_debug():
+    text = request.args.get("text","")
+    return jsonify(text=text, resolution=veh_resolve(text))
 
 @app.post("/webhook")
 def webhook():
@@ -364,7 +476,6 @@ def webhook():
     if s and s.get("intent") == "auto_ins":
         handle_auto(sender, text);  return jsonify(ok=True)
 
-    # NLU
     intent, conf = nlu_predict(text)
     intent = heuristic_intent(text, intent, conf)
     print(f"[NLU] intent={intent} conf≈{conf:.2f}")
@@ -406,4 +517,6 @@ def nlu_retrain_endpoint():
     return jsonify(ok=True, msg="retrained", db=("on" if DB_ENABLED else "off"))
 
 if __name__ == "__main__":
+    ensure_schema()
+    nlu_retrain()
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
