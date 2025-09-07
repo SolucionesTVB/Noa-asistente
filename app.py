@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 import os, re, time, json, threading, requests
 from flask import Flask, request, jsonify
 from rapidfuzz import process, fuzz
@@ -238,3 +239,7 @@ if __name__ == "__main__":
     ensure_schema()
     nlu_retrain()
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+=======
+# 👇 Pegás aquí todo el código grande que te pasé
+# ...
+>>>>>>> 5c04dac (Reemplazo app.py completo con NLU y pólizas)
